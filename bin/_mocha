@@ -308,6 +308,8 @@ program.on('option:interfaces', () => {
 });
 
 // -r, --require
+const preps = [];
+const unpreps = [];
 
 module.paths.push(cwd, join(cwd, 'node_modules'));
 
@@ -493,140 +495,150 @@ program.compilers.forEach(c => {
 // requires
 
 requires.forEach(mod => {
-  require(mod);
+  const m = require(mod);
+  if (typeof m.onPrepare === 'function') {
+    // the module has onPrepare
+    preps.push(m.onPrepare);
+  }
+  if (typeof m.onUnprepare === 'function') {
+    // the module has onUnprepare
+    unpreps.push(m.onUnprepare);
+  }
 });
 
-// interface
+Promise.all(preps.map(fn => fn())).then(() => {
+  // interface
 
-mocha.ui(program.ui);
+  mocha.ui(program.ui);
 
-// args
+  // args
 
-const args = program.args;
+  const args = program.args;
 
-// default files to test/*.{js,coffee}
+  // default files to test/*.{js,coffee}
 
-if (!args.length) {
-  args.push('test');
-}
+  if (!args.length) {
+    args.push('test');
+  }
 
-args.forEach(arg => {
-  let newFiles;
-  try {
-    newFiles = utils.lookupFiles(arg, extensions, program.recursive);
-  } catch (err) {
-    if (err.message.indexOf('cannot resolve path') === 0) {
-      console.error(
-        `Warning: Could not find any test files matching pattern: ${arg}`
+  args.forEach(arg => {
+    let newFiles;
+    try {
+      newFiles = utils.lookupFiles(arg, extensions, program.recursive);
+    } catch (err) {
+      if (err.message.indexOf('cannot resolve path') === 0) {
+        console.error(
+          `Warning: Could not find any test files matching pattern: ${arg}`
+        );
+        return;
+      }
+
+      throw err;
+    }
+
+    if (typeof newFiles !== 'undefined') {
+      if (typeof newFiles === 'string') {
+        newFiles = [newFiles];
+      }
+      newFiles = newFiles.filter(fileName =>
+        program.exclude.every(pattern => !minimatch(fileName, pattern))
       );
-      return;
     }
 
-    throw err;
-  }
-
-  if (typeof newFiles !== 'undefined') {
-    if (typeof newFiles === 'string') {
-      newFiles = [newFiles];
-    }
-    newFiles = newFiles.filter(fileName =>
-      program.exclude.every(pattern => !minimatch(fileName, pattern))
-    );
-  }
-
-  files = files.concat(newFiles);
-});
-
-if (!files.length) {
-  console.error('No test files found');
-  process.exit(1);
-}
-
-// resolve
-let fileArgs = program.file.map(path => resolve(path));
-files = files.map(path => resolve(path));
-
-if (program.sort) {
-  files.sort();
-}
-
-// add files given through --file to be ran first
-files = fileArgs.concat(files);
-
-// --watch
-
-let runner;
-let loadAndRun;
-let purge;
-let rerun;
-
-if (program.watch) {
-  console.log();
-  hideCursor();
-  process.on('SIGINT', () => {
-    showCursor();
-    console.log('\n');
-    process.exit(130);
+    files = files.concat(newFiles);
   });
 
-  const watchFiles = utils.files(cwd, program.watchExtensions);
-  let runAgain = false;
+  if (!files.length) {
+    console.error('No test files found');
+    process.exit(1);
+  }
 
-  loadAndRun = () => {
-    try {
-      mocha.files = files;
-      runAgain = false;
-      runner = mocha.run(() => {
-        runner = null;
-        if (runAgain) {
+  // resolve
+  let fileArgs = program.file.map(path => resolve(path));
+  files = files.map(path => resolve(path));
+
+  if (program.sort) {
+    files.sort();
+  }
+
+  // add files given through --file to be ran first
+  files = fileArgs.concat(files);
+
+  return new Promise((fulfill, reject) => {
+    // --watch
+
+    let runner;
+    let loadAndRun;
+    let purge;
+    let rerun;
+
+    if (program.watch) {
+      console.log();
+      hideCursor();
+      process.on('SIGINT', () => {
+        showCursor();
+        console.log('\n');
+        process.exit(130);
+      });
+
+      const watchFiles = utils.files(cwd, program.watchExtensions);
+      let runAgain = false;
+
+      loadAndRun = () => {
+        try {
+          mocha.files = files;
+          runAgain = false;
+          runner = mocha.run(() => {
+            runner = null;
+            if (runAgain) {
+              rerun();
+              return;
+            }
+            fulfill();
+          });
+        } catch (e) {
+          console.log(e.stack);
+        }
+      };
+
+      purge = () => {
+        watchFiles.forEach(file => {
+          delete require.cache[file];
+        });
+      };
+
+      loadAndRun();
+
+      rerun = () => {
+        purge();
+        stop();
+        if (!program.grep) {
+          mocha.grep(null);
+        }
+        mocha.suite = mocha.suite.clone();
+        mocha.suite.ctx = new Mocha.Context();
+        mocha.ui(program.ui);
+        loadAndRun();
+      };
+
+      utils.watch(watchFiles, () => {
+        runAgain = true;
+        if (runner) {
+          runner.abort();
+        } else {
           rerun();
         }
       });
-    } catch (e) {
-      console.log(e.stack);
-    }
-  };
-
-  purge = () => {
-    watchFiles.forEach(file => {
-      delete require.cache[file];
-    });
-  };
-
-  loadAndRun();
-
-  rerun = () => {
-    purge();
-    stop();
-    if (!program.grep) {
-      mocha.grep(null);
-    }
-    mocha.suite = mocha.suite.clone();
-    mocha.suite.ctx = new Mocha.Context();
-    mocha.ui(program.ui);
-    loadAndRun();
-  };
-
-  utils.watch(watchFiles, () => {
-    runAgain = true;
-    if (runner) {
-      runner.abort();
     } else {
-      rerun();
+      // load
+
+      mocha.files = files;
+      runner = mocha.run(code => {
+        fulfill();
+        program.exit ? exit(code) : exitLater(code);
+      });
     }
+  }).then(() => {
+    return Promise.all(unpreps.map(fn => fn()));
   });
-} else {
-  // load
-
-  mocha.files = files;
-  runner = mocha.run(program.exit ? exit : exitLater);
-}
-
-process.on('SIGINT', () => {
-  runner.abort();
-
-  // This is a hack:
-  // Instead of `process.exit(130)`, set runner.failures to 130 (exit code for SIGINT)
-  // The amount of failures will be emitted as error code later
-  runner.failures = 130;
 });
